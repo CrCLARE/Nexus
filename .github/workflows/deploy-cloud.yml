@@ -1,0 +1,147 @@
+name: Deploy Nexus (One-Click Setup)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloudflare_token:
+        description: 'Your Cloudflare API Token (with Edit Workers permissions)'
+        required: true
+      init_admin_password:
+        description: 'Set a custom password (Used for /setup AND decrypting the ZIP)'
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Build & Deploy Nexus
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Create D1 Database & KV Namespace
+        id: create_resources
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ github.event.inputs.cloudflare_token }}
+        run: |
+          echo "Creating D1 Database..."
+          # Use --json to easily parse the ID
+          D1_OUTPUT=$(wrangler d1 create nexus-db --json || true)
+          D1_ID=$(echo "$D1_OUTPUT" | grep -o '"uuid": *"[^"]*"' | head -1 | cut -d'"' -f4)
+          
+          # If database already exists, fetch its ID
+          if [ -z "$D1_ID" ]; then
+            echo "D1 creation failed or already exists, trying to fetch existing..."
+            D1_ID=$(wrangler d1 list --json | grep -A 5 '"name": "nexus-db"' | grep '"uuid"' | cut -d'"' -f4)
+          fi
+          
+          if [ -z "$D1_ID" ]; then
+            echo "ERROR: Failed to get D1 ID."
+            exit 1
+          fi
+          echo "D1_ID=$D1_ID" >> $GITHUB_ENV
+
+          echo "Creating KV Namespace..."
+          KV_OUTPUT=$(wrangler kv namespace create "KV" --json || true)
+          KV_ID=$(echo "$KV_OUTPUT" | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4)
+          
+          if [ -z "$KV_ID" ]; then
+            echo "KV creation failed or already exists, trying to fetch existing..."
+            KV_ID=$(wrangler kv namespace list --json | grep -A 2 '"title": "KV"' | grep '"id"' | cut -d'"' -f4)
+          fi
+
+          if [ -z "$KV_ID" ]; then
+            echo "ERROR: Failed to get KV ID."
+            exit 1
+          fi
+          echo "KV_ID=$KV_ID" >> $GITHUB_ENV
+
+      - name: Inject IDs into wrangler.toml
+        run: |
+          # Replace placeholder IDs in wrangler.toml
+          sed -i "s/database_id = \".*\"/database_id = \"${{ env.D1_ID }}\"/g" wrangler.toml
+          sed -i "s/id = \".*\"/id = \"${{ env.KV_ID }}\"/g" wrangler.toml
+
+      - name: Generate JWT Secret
+        id: gen_jwt
+        run: |
+          # Generate a secure random 32-byte hex string
+          JWT_SECRET=$(openssl rand -hex 32)
+          echo "JWT_SECRET=$JWT_SECRET" >> $GITHUB_ENV
+
+      - name: Deploy to Cloudflare Workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ github.event.inputs.cloudflare_token }}
+        run: |
+          wrangler deploy
+
+      - name: Initialize Remote Database Schema
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ github.event.inputs.cloudflare_token }}
+        run: |
+          # Execute schema.sql to the newly created D1 database
+          wrangler d1 execute nexus-db --file=./schema.sql --remote
+
+      - name: Inject Secrets into Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ github.event.inputs.cloudflare_token }}
+        run: |
+          # Pipe secrets directly to wrangler
+          echo "${{ github.event.inputs.init_admin_password }}" | wrangler secret put INIT_ADMIN_PASSWORD
+          echo "${{ env.JWT_SECRET }}" | wrangler secret put JWT_SECRET
+
+      - name: Generate Encrypted Credentials TXT
+        run: |
+          # Write all critical info to a plain text file
+          cat <<EOF > nexus-credentials.txt
+          ============================================================
+          Nexus Deployment Successful!
+          ============================================================
+          
+          Your Cloudflare resources have been generated.
+          Please keep this file safe. You can also find these IDs in your Cloudflare dashboard.
+
+          --- Bootstrap Password ---
+          ${{ github.event.inputs.init_admin_password }}  <-- Use this to initialize the system at /setup.html
+
+          --- Cloudflare D1 Database ---
+          Name: nexus-db
+          ID: ${{ env.D1_ID }}
+
+          --- Cloudflare KV Namespace ---
+          Name: KV
+          ID: ${{ env.KV_ID }}
+
+          --- JWT Secret ---
+          ${{ env.JWT_SECRET }}
+
+          ============================================================
+          Powered by Nexus (https://github.com/CrCLARE/Nexus)
+          ============================================================
+          EOF
+          
+          # Compress and encrypt the file using the user's password
+          zip -P "${{ github.event.inputs.init_admin_password }}" nexus-secrets.zip nexus-credentials.txt
+          
+          # Remove the plaintext file for security
+          rm nexus-credentials.txt
+
+      - name: Upload Encrypted Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-deployment-secrets
+          path: nexus-secrets.zip
+          retention-days: 1 # Expires in 1 day (Half a day is not natively supported, 1 day is the minimum)
+
+      - name: Output Success Message
+        run: |
+          echo "🎉 Deployment Successful!"
+          echo "👉 Please go to the 'Summary' tab of this Action run to download the 'nexus-deployment-secrets' artifact."
+          echo "👉 The ZIP file is encrypted with your custom password."
