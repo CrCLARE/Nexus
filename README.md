@@ -12,6 +12,12 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![JavaScript](https://img.shields.io/badge/JavaScript-100%25-yellow?logo=javascript)](https://github.com/CrCLARE/Nexus)
 
+---
+
+[English](./README.md) | [简体中文](./zh/README.md)
+
+---
+
 [Website](https://nexus.crclare.top) • [Documentation(Not yet completed)](https://sso.crclare.top) • [Report Bug](../../issues) • [Request Feature](../../issues)
 
 </div>
