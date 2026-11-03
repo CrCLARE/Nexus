@@ -1,158 +1,117 @@
 // ============================================================
-// Nexus - User API Routes
-// SECURITY: Requires valid session. Enforces strict IDOR prevention
-// by pulling user ID from the verified token, not the request body.
+// Nexus - Setup & Bootstrap Route
+// SECURITY: Implements the double-gate initialization logic.
+// Prevents unauthorized first-run registration.
 // ============================================================
 
 import { json, error } from '../utils/response.js';
-import { getAuthenticatedUser } from '../middleware/auth.js';
-import { hashPassword, verifyPassword } from '../utils/crypto.js';
+import { generateUUID, hashPassword, constantTimeEqual } from '../utils/crypto.js';
+import { signJwt, verifyJwt, createSessionCookie } from '../services/jwt.js';
 
-export async function handleUserAPI(request, env) {
-  const url = new URL(request.url);
-  const path = url.pathname;
-
-  // 1. Enforce User Authentication
-  const user = await getAuthenticatedUser(request, env);
-  if (!user) {
-    return error('ERR_UNAUTHORIZED', 'Authentication required', 401);
+export async function handleSetupAPI(request, env) {
+  if (request.method !== 'POST') {
+    return error('ERR_METHOD', 'Method not allowed', 405);
   }
 
-  // ==========================================
-  // GET /api/user/me
-  // ==========================================
-  if (path === '/api/user/me' && request.method === 'GET') {
-    try {
-      const profile = await env.DB.prepare(
-        "SELECT id, email, role, nickname, app_enabled, created_at FROM users WHERE id = ?"
-      ).bind(user.id).first();
+  try {
+    const url = new URL(request.url);
+    const step = url.searchParams.get('step');
+    const body = await request.json();
 
-      const oauths = await env.DB.prepare(
-        "SELECT provider FROM oauth_accounts WHERE user_id = ?"
-      ).bind(user.id).all();
-      
-      const passkeys = await env.DB.prepare(
-        "SELECT COUNT(*) as count FROM passkeys WHERE user_id = ?"
-      ).bind(user.id).first();
+    // ==========================================
+    // GATE 1: Verify Bootstrap Password
+    // ==========================================
+    if (step === 'verify') {
+      const { bootstrap_password } = body;
 
-      const boundOAuths = oauths.results ? oauths.results.map(o => o.provider) : [];
-
-      return json({
-        nexusId: profile.id,
-        email: profile.email,
-        role: profile.role,
-        nickname: profile.nickname || profile.email.split('@')[0], // Fallback to email prefix
-        appEnabled: profile.app_enabled === 1,
-        passkeysCount: passkeys ? passkeys.count : 0,
-        createdAt: profile.created_at,
-        boundOAuths: boundOAuths
-      });
-    } catch (e) {
-      return error('ERR_DB', 'Failed to fetch user data', 500);
-    }
-  }
-
-  // ==========================================
-  // POST /api/user/update-profile
-  // ==========================================
-  if (path === '/api/user/update-profile' && request.method === 'POST') {
-    try {
-      const { nickname } = await request.json();
-      
-      if (!nickname || nickname.length > 32) {
-        return error('ERR_INVALID_INPUT', 'Invalid nickname (Max 32 chars)', 400);
+      if (!bootstrap_password || !env.INIT_ADMIN_PASSWORD) {
+        return error('ERR_MISSING', 'Missing configuration', 400);
       }
 
-      await env.DB.prepare(
-        "UPDATE users SET nickname = ?, updated_at = ? WHERE id = ?"
-      ).bind(nickname, Date.now(), user.id).run();
-      
-      return json({ success: true, message: 'Profile updated' });
-    } catch (e) {
-      return error('ERR_DB', 'Failed to update profile', 500);
-    }
-  }
-
-  // ==========================================
-  // POST /api/user/change-password
-  // ==========================================
-  if (path === '/api/user/change-password' && request.method === 'POST') {
-    try {
-      const { oldPassword, newPassword } = await request.json();
-      if (!oldPassword || !newPassword || newPassword.length < 8) {
-        return error('ERR_INVALID_INPUT', 'Invalid password format', 400);
+      // SECURITY: Constant-time comparison to prevent timing attacks
+      const isPasswordValid = constantTimeEqual(bootstrap_password, env.INIT_ADMIN_PASSWORD);
+      if (!isPasswordValid) {
+        return error('ERR_INVALID_PWD', 'Invalid bootstrap password', 401);
       }
 
-      const dbUser = await env.DB.prepare("SELECT password_hash, password_salt FROM users WHERE id = ?").bind(user.id).first();
-      
-      // SECURITY: Verify old password before allowing change
-      if (dbUser.password_hash) {
-        const isValid = await verifyPassword(oldPassword, dbUser.password_hash, dbUser.password_salt);
-        if (!isValid) return error('ERR_INVALID_CREDENTIALS', 'Incorrect old password', 401);
+      // Check if the system is already initialized
+      const isInit = await env.DB.prepare("SELECT value FROM system_settings WHERE key = 'is_initialized'").first();
+      if (isInit && isInit.value === 'true') {
+        return error('ERR_ALREADY_INIT', 'System already initialized', 403);
       }
 
-      const { hash, salt } = await hashPassword(newPassword);
-      await env.DB.prepare(
-        "UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?"
-      ).bind(hash, salt, Date.now(), user.id).run();
-
-      return json({ success: true, message: 'Password changed successfully' });
-    } catch (e) {
-      return error('ERR_DB', 'Failed to change password', 500);
+      // Issue temporary 10-min setup token
+      const setupToken = await signJwt({ purpose: 'setup' }, env.JWT_SECRET, 600);
+      return json({ success: true, setup_token: setupToken });
     }
-  }
 
-  // ==========================================
-  // GET /api/user/export
-  // SECURITY: Generates a JSON payload of all user data (GDPR)
-  // ==========================================
-  if (path === '/api/user/export' && request.method === 'GET') {
-    try {
-      // Check if admin allows export
-      const allowExport = await env.DB.prepare("SELECT value FROM system_settings WHERE key = 'allow_uc_export'").first();
-      if (allowExport && allowExport.value === 'false') {
-        return error('ERR_FORBIDDEN', 'Data export is disabled by administrator', 403);
+    // ==========================================
+    // GATE 2: Create Super Admin
+    // ==========================================
+    if (step === 'init') {
+      const authHeader = request.headers.get('Authorization');
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return error('ERR_UNAUTHORIZED', 'Missing setup token', 401);
+      }
+      
+      const token = authHeader.split(' ')[1];
+      let payload;
+      try {
+        payload = await verifyJwt(token, env.JWT_SECRET);
+      } catch (e) {
+        return error('ERR_EXPIRED', 'Setup token expired or invalid', 401);
       }
 
-      const profile = await env.DB.prepare("SELECT id, email, role, nickname, created_at FROM users WHERE id = ?").bind(user.id).first();
-      const oauths = await env.DB.prepare("SELECT provider, created_at FROM oauth_accounts WHERE user_id = ?").bind(user.id).all();
+      if (payload.purpose !== 'setup') {
+        return error('ERR_FORBIDDEN', 'Invalid token purpose', 403);
+      }
+
+      const { email, password } = body;
+      if (!email || !password || password.length < 8) {
+        return error('ERR_INVALID_INPUT', 'Invalid email or password too short', 400);
+      }
+
+      const userId = generateUUID();
+      const { hash, salt } = await hashPassword(password);
+      const now = Date.now();
+
+      // SECURITY: Parameterized queries
+      const createAdmin = env.DB.prepare(
+        `INSERT INTO users (id, email, role, password_hash, password_salt, status, created_at, updated_at) 
+         VALUES (?, ?, 'super_admin', ?, ?, 'active', ?, ?)`
+      ).bind(userId, email.toLowerCase(), hash, salt, now, now);
+
+      // FIXED: Added updated_at field to match the schema constraint
+      const setInit = env.DB.prepare(
+        `INSERT INTO system_settings (key, value, updated_at) VALUES ('is_initialized', 'true', ?)`
+      ).bind(now);
       
-      const exportData = {
-        export_date: new Date().toISOString(),
-        nexus_id: profile.id,
-        email: profile.email,
-        nickname: profile.nickname,
-        role: profile.role,
-        joined_at: profile.created_at,
-        connected_accounts: oauths.results || []
-      };
-
-      const headers = {
-        'Content-Type': 'application/json',
-        'Content-Disposition': `attachment; filename="nexus-export-${profile.id}.json"`
-      };
-
-      return new Response(JSON.stringify(exportData, null, 2), { status: 200, headers });
-    } catch (e) {
-      return error('ERR_DB', 'Failed to export data', 500);
-    }
-  }
-
-  // ==========================================
-  // POST /api/user/delete-account
-  // ==========================================
-  if (path === '/api/user/delete-account' && request.method === 'POST') {
-    try {
-      // SECURITY: Soft-delete or hard-delete. Here we do a hard delete (cascade deletes bindings)
-      await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(user.id).run();
+      const setSiteName = env.DB.prepare(
+        `INSERT INTO system_settings (key, value, updated_at) VALUES ('site_name', 'Nexus', ?)`
+      ).bind(now);
       
-      // Clear session cookie
-      const cookieHeader = 'nexus_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0';
-      return json({ success: true, message: 'Account deleted' }, 200, { 'Set-Cookie': cookieHeader });
-    } catch (e) {
-      return error('ERR_DB', 'Failed to delete account', 500);
-    }
-  }
+      const setTermsVersion = env.DB.prepare(
+        `INSERT INTO system_settings (key, value, updated_at) VALUES ('terms_version', 'v1.0', ?)`
+      ).bind(now);
 
-  return error('ERR_NOT_FOUND', 'User route not found', 404);
+      // Execute batch transaction
+      await env.DB.batch([createAdmin, setInit, setSiteName, setTermsVersion]);
+
+      // Auto-login Super Admin
+      const sessionJwt = await signJwt({ uid: userId, role: 'super_admin' }, env.JWT_SECRET, 86400 * 7);
+      const cookieHeader = createSessionCookie(sessionJwt, 86400 * 7);
+
+      return json(
+        { success: true, message: 'System initialized' },
+        200,
+        { 'Set-Cookie': cookieHeader }
+      );
+    }
+
+    return error('ERR_INVALID_STEP', 'Invalid setup step', 400);
+
+  } catch (e) {
+    console.error('[Setup Error]', e);
+    return error('ERR_INTERNAL', 'Internal Server Error during setup', 500);
+  }
 }
